@@ -110,13 +110,12 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
         },
       );
 
-      final translatedResponse = NovelWebResponse(
-        text: translatedText,
-        seriesNavigation: _novelStore.novelTextResponse?.seriesNavigation,
-        images: _novelStore.novelTextResponse?.images ?? {},
-      );
+      final clonedMap =
+          jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
+      final translatedResponse = NovelWebResponse.fromJson(clonedMap);
+      translatedResponse.text = translatedText;
 
-      _translatedSpans = await compute(buildSpans, translatedResponse);
+      _translatedSpans = novelSpansGenerator.buildSpans(translatedResponse);
 
       setState(() {
         _isShowingTranslated = true;
