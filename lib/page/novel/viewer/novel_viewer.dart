@@ -45,6 +45,7 @@ import 'package:pixez/saf_plugin.dart';
 import 'package:pixez/supportor_plugin.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:path/path.dart' as Path;
+import 'package:pixez/network/gemini_translator.dart';
 
 class NovelViewerPage extends StatefulWidget {
   final int id;
@@ -65,6 +66,120 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
   bool supportTranslate = false;
   String _selectedText = "";
   NovelSpansGenerator novelSpansGenerator = NovelSpansGenerator();
+
+  List<NovelSpansData>? _originalSpans;
+  List<NovelSpansData>? _translatedSpans;
+  bool _isShowingTranslated = false;
+  bool _isTranslating = false;
+
+  Future<void> _translateNovel() async {
+    if (_isTranslating) return;
+
+    if (_translatedSpans != null) {
+      setState(() {
+        _isShowingTranslated = !_isShowingTranslated;
+        _novelStore.spans =
+            _isShowingTranslated ? _translatedSpans! : _originalSpans!;
+      });
+      BotToast.showText(
+        text: _isShowingTranslated ? "日本語翻訳を表示中" : "中国語原文を表示中",
+      );
+      return;
+    }
+
+    String? apiKey = await GeminiTranslator.getApiKey();
+    if (apiKey == null || apiKey.isEmpty) {
+      final inputKey = await _showApiKeyDialog();
+      if (inputKey == null || inputKey.isEmpty) return;
+      apiKey = inputKey;
+    }
+
+    setState(() {
+      _isTranslating = true;
+    });
+
+    final cancelToast = BotToast.showLoading();
+
+    try {
+      _originalSpans = List.from(_novelStore.spans);
+
+      final translatedText = await GeminiTranslator.translateNovel(
+        _novelStore.novelTextResponse!.text,
+        onProgress: (progress, status) {
+          BotToast.showText(text: status);
+        },
+      );
+
+      final translatedResponse = NovelWebResponse(
+        text: translatedText,
+        seriesNavigation: _novelStore.novelTextResponse?.seriesNavigation,
+        images: _novelStore.novelTextResponse?.images ?? {},
+      );
+
+      _translatedSpans = await compute(buildSpans, translatedResponse);
+
+      setState(() {
+        _isShowingTranslated = true;
+        _novelStore.spans = _translatedSpans!;
+      });
+
+      BotToast.showText(text: "日本語への極上官能翻訳が完了しました！");
+    } catch (e) {
+      BotToast.showText(text: "翻訳失敗: $e");
+    } finally {
+      cancelToast();
+      setState(() {
+        _isTranslating = false;
+      });
+    }
+  }
+
+  Future<String?> _showApiKeyDialog() async {
+    final controller = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Gemini APIキーの設定"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                "Google AI Studioで取得した無料のGemini APIキーを入力してください。",
+                style: TextStyle(fontSize: 13),
+              ),
+              SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                decoration: InputDecoration(
+                  hintText: "AIzaSy...",
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("キャンセル"),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final key = controller.text.trim();
+                if (key.isNotEmpty) {
+                  await GeminiTranslator.saveApiKey(key);
+                  Navigator.pop(context, key);
+                }
+              },
+              child: Text("保存して翻訳"),
+            ),
+          ],
+        );
+      },
+    );
+  }
 
   Future<void> initMethod() async {
     if (!Platform.isAndroid) return;
@@ -215,6 +330,16 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
       ),
       backgroundColor: Colors.transparent,
       actions: <Widget>[
+        IconButton(
+          icon: Icon(
+            _isShowingTranslated ? Icons.translate : Icons.g_translate,
+            color: _isShowingTranslated
+                ? Theme.of(context).colorScheme.primary
+                : Theme.of(context).textTheme.bodyLarge!.color,
+          ),
+          tooltip: _isShowingTranslated ? "原文に戻す" : "AI官能翻訳",
+          onPressed: _translateNovel,
+        ),
         NovelBookmarkButton(novel: _novelStore.novel!),
         IconButton(
           onPressed: () {
