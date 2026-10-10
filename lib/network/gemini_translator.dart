@@ -46,7 +46,7 @@ class GeminiTranslator {
       throw Exception('Gemini APIキーが設定されていません。');
     }
 
-    // チャンクサイズを約6000文字に拡大（一般的な短編なら1回で完了）
+    // チャンクサイズを約6000文字に設定
     final chunks = _splitIntoChunks(rawText, maxChunkSize: 6000);
     final translatedChunks = <String>[];
 
@@ -58,7 +58,6 @@ class GeminiTranslator {
       }
 
       if (i > 0) {
-        // レートリミット回避のための短いインターバル
         await Future.delayed(const Duration(seconds: 2));
       }
 
@@ -69,152 +68,113 @@ class GeminiTranslator {
     return translatedChunks.join('\n\n');
   }
 
-  static String? _cachedWorkingModel;
-
-  /// 利用可能なテキスト生成モデル一覧をGoogle APIから自動取得
-  static Future<List<String>> _getAvailableModels(String apiKey) async {
-    if (_cachedWorkingModel != null) {
-      return [_cachedWorkingModel!];
-    }
-
-    try {
-      final listUrl =
-          'https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey';
-      final response = await _dio.get(
-        listUrl,
-        options: Options(
-          headers: {'x-goog-api-key': apiKey},
-          sendTimeout: const Duration(seconds: 15),
-          receiveTimeout: const Duration(seconds: 15),
-        ),
-      );
-
-      if (response.statusCode == 200 && response.data != null) {
-        final modelsList = response.data['models'] as List?;
-        if (modelsList != null) {
-          final matched = <String>[];
-          for (final m in modelsList) {
-            final name = m['name'] as String? ?? '';
-            final methods = m['supportedGenerationMethods'] as List? ?? [];
-            if (methods.contains('generateContent')) {
-              final cleanName = name.replaceFirst('models/', '');
-              final lower = cleanName.toLowerCase();
-              // 音声書き起こし、TTS、画像生成、埋め込み等の特殊モデルを徹底除外
-              if (lower.contains('transcribe') ||
-                  lower.contains('tts') ||
-                  lower.contains('imagen') ||
-                  lower.contains('embedding') ||
-                  lower.contains('aqa') ||
-                  lower.contains('robotics')) {
-                continue;
-              }
-              matched.add(cleanName);
-            }
-          }
-          if (matched.isNotEmpty) {
-            // 純粋なflashモデルを最優先、次にproモデル
-            matched.sort((a, b) {
-              final aFlash = a.contains('flash');
-              final bFlash = b.contains('flash');
-              if (aFlash && !bFlash) return -1;
-              if (!aFlash && bFlash) return 1;
-              return b.compareTo(a);
-            });
-            return matched;
-          }
-        }
-      }
-    } catch (_) {
-      // 取得失敗時は静的フォールバック
-    }
-
-    return [
-      'gemini-2.5-flash',
-      'gemini-3.5-flash',
-      'gemini-3.8-flash',
-      'gemini-1.5-flash-latest',
-      'gemini-1.5-flash',
-      'gemini-2.0-flash-exp',
-    ];
-  }
-
   /// 1チャンクをGemini APIに送信して翻訳
+  /// 最新の Interactions API と従来の generateContent API の両方に対応
   static Future<String> _translateChunk(String chunk, String apiKey) async {
-    final models = await _getAvailableModels(apiKey);
+    final prompt =
+        "$_systemInstruction\n\n【以下の中国語小説テキストを日本語に翻訳してください】\n$chunk";
+
+    final models = [
+      'gemini-3.8-flash',
+      'gemini-2.5-flash',
+      'gemini-1.5-flash',
+      'gemini-3.5-flash',
+    ];
+
     dynamic lastException;
 
     for (final model in models) {
-      final url =
-          'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey';
-
-      final requestBody = {
-        "contents": [
-          {
-            "role": "user",
-            "parts": [
-              {
-                "text":
-                    "$_systemInstruction\n\n【以下の中国語小説テキストを日本語に翻訳してください】\n$chunk"
-              }
-            ]
-          }
-        ],
-        "generationConfig": {
-          "temperature": 0.4,
-          "maxOutputTokens": 8192,
-        },
-        "safetySettings": [
-          {
-            "category": "HARM_CATEGORY_HARASSMENT",
-            "threshold": "BLOCK_NONE"
-          },
-          {
-            "category": "HARM_CATEGORY_HATE_SPEECH",
-            "threshold": "BLOCK_NONE"
-          },
-          {
-            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-            "threshold": "BLOCK_NONE"
-          },
-          {
-            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "threshold": "BLOCK_NONE"
-          }
-        ]
-      };
-
+      // 1. 最新の Interactions API (2026年推奨規格) を試行
       try {
+        const interactionUrl =
+            'https://generativelanguage.googleapis.com/v1beta/interactions';
         final response = await _dio.post(
-          url,
+          interactionUrl,
+          data: {
+            "model": model,
+            "input": prompt,
+          },
+          options: Options(
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey,
+            },
+            sendTimeout: const Duration(seconds: 45),
+            receiveTimeout: const Duration(seconds: 60),
+          ),
+        );
+
+        if (response.statusCode == 200 && response.data != null) {
+          final text = _extractTextFromResponse(response.data);
+          if (text != null && text.trim().isNotEmpty) {
+            return text.trim();
+          }
+        }
+      } catch (e) {
+        lastException = e;
+      }
+
+      // 2. 従来の generateContent API で試行
+      try {
+        final generateUrl =
+            'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey';
+        final requestBody = {
+          "contents": [
+            {
+              "role": "user",
+              "parts": [
+                {"text": prompt}
+              ]
+            }
+          ],
+          "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 8192,
+          },
+          "safetySettings": [
+            {
+              "category": "HARM_CATEGORY_HARASSMENT",
+              "threshold": "BLOCK_NONE"
+            },
+            {
+              "category": "HARM_CATEGORY_HATE_SPEECH",
+              "threshold": "BLOCK_NONE"
+            },
+            {
+              "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+              "threshold": "BLOCK_NONE"
+            },
+            {
+              "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+              "threshold": "BLOCK_NONE"
+            }
+          ]
+        };
+
+        final response = await _dio.post(
+          generateUrl,
           data: requestBody,
           options: Options(
             headers: {
               'Content-Type': 'application/json',
               'x-goog-api-key': apiKey,
             },
-            sendTimeout: const Duration(seconds: 60),
-            receiveTimeout: const Duration(seconds: 90),
+            sendTimeout: const Duration(seconds: 45),
+            receiveTimeout: const Duration(seconds: 60),
           ),
         );
 
-        if (response.statusCode == 200) {
-          final data = response.data;
-          final candidates = data['candidates'] as List?;
-          if (candidates != null && candidates.isNotEmpty) {
-            final content = candidates[0]['content'];
-            final parts = content['parts'] as List?;
-            if (parts != null && parts.isNotEmpty) {
-              _cachedWorkingModel = model;
-              return parts[0]['text'] as String;
-            }
+        if (response.statusCode == 200 && response.data != null) {
+          final text = _extractTextFromResponse(response.data);
+          if (text != null && text.trim().isNotEmpty) {
+            return text.trim();
           }
         }
       } on DioException catch (e) {
         if (e.response != null && e.response?.data != null) {
           final err = e.response?.data;
           final msg = err['error']?['message'] ?? e.message;
-          lastException = Exception('Gemini API エラー ($model): $msg');
-          // モデル未対応またはクォータ超過（429）の場合、次のモデルへフォールバック
+          lastException = Exception('Gemini API ($model): $msg');
           continue;
         }
         lastException = e;
@@ -224,6 +184,44 @@ class GeminiTranslator {
     }
 
     throw lastException ?? Exception('Gemini API で翻訳結果が取得できませんでした。');
+  }
+
+  /// レスポンスJSONから柔軟にテキストを抽出
+  static String? _extractTextFromResponse(dynamic data) {
+    if (data == null) return null;
+
+    // 1. Interactions API 形式: data['steps']
+    if (data['steps'] is List) {
+      for (final step in data['steps']) {
+        if (step['content'] is List) {
+          for (final c in step['content']) {
+            if (c['text'] is String && (c['text'] as String).isNotEmpty) {
+              return c['text'] as String;
+            }
+          }
+        }
+        if (step['text'] is String && (step['text'] as String).isNotEmpty) {
+          return step['text'] as String;
+        }
+      }
+    }
+
+    // 2. generateContent 形式: data['candidates']
+    if (data['candidates'] is List && (data['candidates'] as List).isNotEmpty) {
+      final cand = data['candidates'][0];
+      if (cand['content'] != null && cand['content']['parts'] is List) {
+        final parts = cand['content']['parts'] as List;
+        if (parts.isNotEmpty && parts[0]['text'] is String) {
+          return parts[0]['text'] as String;
+        }
+      }
+    }
+
+    // 3. 直接プロパティ
+    if (data['output'] is String) return data['output'] as String;
+    if (data['text'] is String) return data['text'] as String;
+
+    return null;
   }
 
   /// 改行を意識して適切なサイズに分割する
