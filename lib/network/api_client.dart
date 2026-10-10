@@ -431,8 +431,11 @@ class ApiClient {
   String? getFormatDate(DateTime? dateTime) {
     if (dateTime == null) {
       return null;
-    } else
-      return "${dateTime.year}-${dateTime.month}-${dateTime.day}";
+    } else {
+      final m = dateTime.month.toString().padLeft(2, '0');
+      final d = dateTime.day.toString().padLeft(2, '0');
+      return "${dateTime.year}-$m-$d";
+    }
   }
 
   Future<Response> getSearchIllust(
@@ -652,6 +655,22 @@ class ApiClient {
         '${a}/v1/search/popular-preview/illust?filter=for_android&include_translated_tag_results=true&merge_plain_keyword_results=true&word=${keyword}&search_target=partial_match_for_tags';
     final result = await httpClient.get(previewUrl);
     return result;
+  }
+
+  Future<Response> getPopularPreviewNovel(
+    String keyword, {
+    String search_target = 'partial_match_for_tags',
+  }) async {
+    return httpClient.get(
+      '/v1/search/popular-preview/novel',
+      queryParameters: notNullMap({
+        'filter': 'for_android',
+        'include_translated_tag_results': true,
+        'merge_plain_keyword_results': true,
+        'word': keyword,
+        'search_target': search_target,
+      }),
+    );
   }
 
   Future<Response> getUserAISettings() async {

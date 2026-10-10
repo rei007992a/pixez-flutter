@@ -207,21 +207,23 @@ class _NovelResultListState extends State<NovelResultList> {
   var _starValue = 0;
 
   _changeQueryParams() {
-    if (_starValue == 0)
+    final queryWord = _starValue == 0
+        ? widget.word
+        : '${widget.word} ${_starValue}users入り';
+    if (selectSort == "popular_desc" &&
+        (accountStore.now == null || accountStore.now!.isPremium == 0)) {
       futureGet = ApiForceSource(
-          futureGet: (bool e) => apiClient.getSearchNovel(widget.word,
-              search_target: searchTarget,
-              sort: selectSort,
-              start_date: _dateTimeRange?.start,
-              end_date: _dateTimeRange?.end));
-    else
-      futureGet = ApiForceSource(
-          futureGet: (bool e) => apiClient.getSearchNovel(
-              '${widget.word} ${_starValue}users入り',
-              search_target: searchTarget,
-              sort: selectSort,
-              start_date: _dateTimeRange?.start,
-              end_date: _dateTimeRange?.end));
+          futureGet: (bool e) => apiClient.getPopularPreviewNovel(
+              queryWord,
+              search_target: searchTarget));
+      return;
+    }
+    futureGet = ApiForceSource(
+        futureGet: (bool e) => apiClient.getSearchNovel(queryWord,
+            search_target: searchTarget,
+            sort: selectSort,
+            start_date: _dateTimeRange?.start,
+            end_date: _dateTimeRange?.end));
   }
 
   void _buildShowBottomSheet(BuildContext context) {
@@ -315,13 +317,6 @@ class _NovelResultListState extends State<NovelResultList> {
                               ),
                             },
                             onValueChanged: (int? index) {
-                              if (accountStore.now != null && index == 2) {
-                                if (accountStore.now!.isPremium == 0) {
-                                  BotToast.showText(text: 'not premium');
-                                  Navigator.of(context).pop();
-                                  return;
-                                }
-                              }
                               setS(() {
                                 selectSort = sort[index!];
                               });
