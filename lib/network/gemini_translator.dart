@@ -37,7 +37,6 @@ class GeminiTranslator {
 ''';
 
   /// 小説本文を翻訳する
-  /// 長文の場合は段落ごとに分割して順次翻訳
   static Future<String> translateNovel(
     String rawText, {
     void Function(double progress, String status)? onProgress,
@@ -47,8 +46,8 @@ class GeminiTranslator {
       throw Exception('Gemini APIキーが設定されていません。');
     }
 
-    // 長文分割（約2500文字区切りを目安に改行位置で分割）
-    final chunks = _splitIntoChunks(rawText, maxChunkSize: 2500);
+    // チャンクサイズを約6000文字に拡大（一般的な短編なら1回で完了）
+    final chunks = _splitIntoChunks(rawText, maxChunkSize: 6000);
     final translatedChunks = <String>[];
 
     for (int i = 0; i < chunks.length; i++) {
@@ -56,6 +55,11 @@ class GeminiTranslator {
       if (onProgress != null) {
         final progress = (i + 1) / chunks.length;
         onProgress(progress, '翻訳中 (${i + 1}/${chunks.length})...');
+      }
+
+      if (i > 0) {
+        // レートリミット回避のための短いインターバル
+        await Future.delayed(const Duration(seconds: 2));
       }
 
       final translated = await _translateChunk(chunk, apiKey.trim());
@@ -67,7 +71,7 @@ class GeminiTranslator {
 
   static String? _cachedWorkingModel;
 
-  /// 利用可能なモデル一覧をGoogle APIから自動取得
+  /// 利用可能なテキスト生成モデル一覧をGoogle APIから自動取得
   static Future<List<String>> _getAvailableModels(String apiKey) async {
     if (_cachedWorkingModel != null) {
       return [_cachedWorkingModel!];
@@ -94,11 +98,21 @@ class GeminiTranslator {
             final methods = m['supportedGenerationMethods'] as List? ?? [];
             if (methods.contains('generateContent')) {
               final cleanName = name.replaceFirst('models/', '');
+              final lower = cleanName.toLowerCase();
+              // 音声書き起こし、TTS、画像生成、埋め込み等の特殊モデルを徹底除外
+              if (lower.contains('transcribe') ||
+                  lower.contains('tts') ||
+                  lower.contains('imagen') ||
+                  lower.contains('embedding') ||
+                  lower.contains('aqa') ||
+                  lower.contains('robotics')) {
+                continue;
+              }
               matched.add(cleanName);
             }
           }
           if (matched.isNotEmpty) {
-            // flashモデルを最優先（降順ソートで最新モデルが先頭に）
+            // 純粋なflashモデルを最優先、次にproモデル
             matched.sort((a, b) {
               final aFlash = a.contains('flash');
               final bFlash = b.contains('flash');
@@ -149,7 +163,6 @@ class GeminiTranslator {
           "temperature": 0.4,
           "maxOutputTokens": 8192,
         },
-        // セーフティフィルターをすべて完全無効化（官能描写をブロックさせない）
         "safetySettings": [
           {
             "category": "HARM_CATEGORY_HARASSMENT",
@@ -179,8 +192,8 @@ class GeminiTranslator {
               'Content-Type': 'application/json',
               'x-goog-api-key': apiKey,
             },
-            sendTimeout: const Duration(seconds: 40),
-            receiveTimeout: const Duration(seconds: 60),
+            sendTimeout: const Duration(seconds: 60),
+            receiveTimeout: const Duration(seconds: 90),
           ),
         );
 
@@ -201,6 +214,7 @@ class GeminiTranslator {
           final err = e.response?.data;
           final msg = err['error']?['message'] ?? e.message;
           lastException = Exception('Gemini API エラー ($model): $msg');
+          // モデル未対応またはクォータ超過（429）の場合、次のモデルへフォールバック
           continue;
         }
         lastException = e;
@@ -213,7 +227,7 @@ class GeminiTranslator {
   }
 
   /// 改行を意識して適切なサイズに分割する
-  static List<String> _splitIntoChunks(String text, {int maxChunkSize = 2500}) {
+  static List<String> _splitIntoChunks(String text, {int maxChunkSize = 6000}) {
     if (text.length <= maxChunkSize) {
       return [text];
     }
