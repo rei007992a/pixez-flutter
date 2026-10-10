@@ -69,13 +69,20 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
 
   List<NovelSpansData>? _originalSpans;
   List<NovelSpansData>? _translatedSpans;
+  String? _translatedTitle;
+  String? _translatedCaption;
   bool _isShowingTranslated = false;
   bool _isTranslating = false;
+  bool _cancelRequested = false;
+  String? _translationProgressText;
 
-  Future<void> _translateNovel() async {
-    if (_isTranslating) return;
+  Future<void> _translateNovel({bool forceRetranslate = false}) async {
+    if (_isTranslating) {
+      _showTranslationOptionsSheet();
+      return;
+    }
 
-    if (_translatedSpans != null) {
+    if (!forceRetranslate && _translatedSpans != null) {
       setState(() {
         _isShowingTranslated = !_isShowingTranslated;
         _novelStore.spans =
@@ -94,47 +101,285 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
       apiKey = inputKey;
     }
 
+    if (forceRetranslate) {
+      await GeminiTranslator.clearCache();
+      _translatedSpans = null;
+      _translatedTitle = null;
+      _translatedCaption = null;
+    }
+
     setState(() {
       _isTranslating = true;
+      _cancelRequested = false;
+      _translationProgressText = "AI翻訳を開始中...";
     });
 
     final cancelToast = BotToast.showLoading();
+    bool loadingDismissed = false;
+    void dismissLoadingIfNeeded() {
+      if (!loadingDismissed) {
+        cancelToast();
+        loadingDismissed = true;
+      }
+    }
 
     try {
-      _originalSpans = List.from(_novelStore.spans);
+      _originalSpans ??= List.from(_novelStore.spans);
 
-      final translatedText = await GeminiTranslator.translateNovel(
-        _novelStore.novelTextResponse!.text,
-        onProgress: (progress, status) {
-          BotToast.showText(text: status);
+      // 1. タイトルとキャプション（あらすじカード）を最優先で翻訳して画面に即座に反映
+      final rawTitle = _novelStore.novel?.title ?? "";
+      final rawCaption = _novelStore.novel?.caption ?? "";
+      if (_translatedTitle == null &&
+          (rawTitle.isNotEmpty || rawCaption.isNotEmpty)) {
+        try {
+          if (mounted) {
+            setState(() {
+              _translationProgressText = "タイトル・あらすじを翻訳中...";
+            });
+          }
+          final headerSource = "【TITLE】\n$rawTitle\n【CAPTION】\n$rawCaption";
+          final translatedHeader =
+              await GeminiTranslator.translateText(headerSource);
+          final captionIdx = translatedHeader.indexOf("【CAPTION】");
+          if (captionIdx != -1) {
+            _translatedTitle = translatedHeader
+                .substring(0, captionIdx)
+                .replaceFirst("【TITLE】", "")
+                .trim();
+            _translatedCaption = translatedHeader
+                .substring(captionIdx + "【CAPTION】".length)
+                .trim();
+          } else {
+            _translatedTitle = translatedHeader
+                .replaceFirst("【TITLE】", "")
+                .trim();
+          }
+          if (mounted && !_cancelRequested) {
+            dismissLoadingIfNeeded();
+            setState(() {
+              _isShowingTranslated = true;
+            });
+          }
+        } catch (headerErr) {
+          LPrinter.d("Header translation skipped or deferred: $headerErr");
+        }
+      }
+
+      // 2. 本文をチャンクごとに順次ストリーミング翻訳（第1パート完了時点で即座に読めるようにする）
+      final fullText = _novelStore.novelTextResponse!.text;
+      final translatedText = await GeminiTranslator.translateNovelProgressive(
+        fullText,
+        novelId: widget.id,
+        isCancelled: () => !mounted || _cancelRequested,
+        onChunkTranslated: (completed, total, partialFullText, statusMessage) {
+          if (!mounted || _cancelRequested) return;
+
+          if (completed > 0) {
+            dismissLoadingIfNeeded();
+
+            final clonedMap =
+                jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
+            final translatedResponse = NovelWebResponse.fromJson(clonedMap);
+            translatedResponse.text = partialFullText;
+            final newSpans = novelSpansGenerator.buildSpans(translatedResponse);
+
+            setState(() {
+              _translatedSpans = newSpans;
+              _isShowingTranslated = true;
+              _translationProgressText = statusMessage;
+              _novelStore.spans = _translatedSpans!;
+            });
+
+            if (completed == 1 && total > 1) {
+              BotToast.showText(
+                text: "冒頭の翻訳が完了しました！読み進めている間に残りを自動翻訳します",
+              );
+            }
+          } else {
+            setState(() {
+              _translationProgressText = statusMessage;
+            });
+          }
         },
       );
 
-      final clonedMap =
-          jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
-      final translatedResponse = NovelWebResponse.fromJson(clonedMap);
-      translatedResponse.text = translatedText;
+      if (mounted && !_cancelRequested) {
+        final clonedMap =
+            jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
+        final translatedResponse = NovelWebResponse.fromJson(clonedMap);
+        translatedResponse.text = translatedText;
+        _translatedSpans = novelSpansGenerator.buildSpans(translatedResponse);
 
-      _translatedSpans = novelSpansGenerator.buildSpans(translatedResponse);
+        setState(() {
+          _isShowingTranslated = true;
+          _translationProgressText = null;
+          _novelStore.spans = _translatedSpans!;
+        });
 
-      setState(() {
-        _isShowingTranslated = true;
-        _novelStore.spans = _translatedSpans!;
-      });
-
-      BotToast.showText(text: "日本語への極上官能翻訳が完了しました！");
+        BotToast.showText(text: "全文の日本語官能翻訳が完了しました！");
+      }
     } catch (e) {
-      BotToast.showText(text: "翻訳失敗: $e");
+      dismissLoadingIfNeeded();
+      final errMsg = e.toString().replaceFirst('Exception: ', '');
+      BotToast.showText(text: "翻訳失敗: $errMsg");
+      if (mounted) {
+        _showTranslationErrorDialog(errMsg, apiKey);
+      }
     } finally {
-      cancelToast();
-      setState(() {
-        _isTranslating = false;
-      });
+      dismissLoadingIfNeeded();
+      if (mounted) {
+        setState(() {
+          _isTranslating = false;
+          _translationProgressText = null;
+        });
+      }
     }
   }
 
-  Future<String?> _showApiKeyDialog() async {
-    final controller = TextEditingController();
+  Future<void> _showTranslationErrorDialog(
+    String errorMessage,
+    String? currentKey,
+  ) async {
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("AI翻訳エラー"),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  errorMessage,
+                  style: TextStyle(fontSize: 13),
+                ),
+                SizedBox(height: 12),
+                Text(
+                  "※APIキーの制限や入力ミスの場合は「APIキーを変更」から再設定できます。",
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).textTheme.bodySmall?.color,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("閉じる"),
+            ),
+            TextButton(
+              onPressed: () async {
+                Navigator.pop(context);
+                final newKey = await _showApiKeyDialog(initialKey: currentKey);
+                if (newKey != null && newKey.isNotEmpty) {
+                  _translateNovel(forceRetranslate: true);
+                }
+              },
+              child: Text("APIキーを変更"),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _translateNovel();
+              },
+              child: Text("再試行"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showTranslationOptionsSheet() async {
+    final currentKey = await GeminiTranslator.getApiKey();
+    final maskedKey = (currentKey != null && currentKey.length > 10)
+        ? "${currentKey.substring(0, 6)}...${currentKey.substring(currentKey.length - 4)}"
+        : (currentKey ?? "未設定");
+
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: Icon(Icons.translate),
+                title: Text("AI官能翻訳メニュー"),
+                subtitle: Text(
+                  _isTranslating
+                      ? (_translationProgressText ?? "翻訳中...")
+                      : "現在のAPIキー: $maskedKey",
+                ),
+              ),
+              Divider(height: 1),
+              if (_translatedSpans != null)
+                ListTile(
+                  leading: Icon(Icons.swap_horiz),
+                  title: Text(
+                    _isShowingTranslated ? "中国語原文に切り替え" : "日本語翻訳に切り替え",
+                  ),
+                  onTap: () {
+                    Navigator.pop(context);
+                    setState(() {
+                      _isShowingTranslated = !_isShowingTranslated;
+                      _novelStore.spans = _isShowingTranslated
+                          ? _translatedSpans!
+                          : _originalSpans!;
+                    });
+                  },
+                ),
+              if (_isTranslating)
+                ListTile(
+                  leading: Icon(Icons.stop_circle_outlined, color: Colors.red),
+                  title: Text("翻訳を中断する"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    setState(() {
+                      _cancelRequested = true;
+                      _isTranslating = false;
+                      _translationProgressText = null;
+                    });
+                    BotToast.showText(text: "翻訳を中断しました");
+                  },
+                ),
+              ListTile(
+                leading: Icon(Icons.key),
+                title: Text("Gemini APIキーを変更・確認"),
+                onTap: () async {
+                  Navigator.pop(context);
+                  final newKey =
+                      await _showApiKeyDialog(initialKey: currentKey);
+                  if (newKey != null && newKey.isNotEmpty && !_isTranslating) {
+                    _translateNovel(forceRetranslate: true);
+                  }
+                },
+              ),
+              if (!_isTranslating)
+                ListTile(
+                  leading: Icon(Icons.refresh),
+                  title: Text("キャッシュを消去して最初から再翻訳"),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _translateNovel(forceRetranslate: true);
+                  },
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<String?> _showApiKeyDialog({String? initialKey}) async {
+    final controller = TextEditingController(text: initialKey ?? "");
     return showDialog<String>(
       context: context,
       builder: (context) {
@@ -145,16 +390,27 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                "Google AI Studioで取得した無料のGemini APIキーを入力してください。",
+                "Google AI Studio (aistudio.google.com/app/apikey) で取得したGemini APIキーを入力してください。",
                 style: TextStyle(fontSize: 13),
               ),
               SizedBox(height: 12),
               TextField(
                 controller: controller,
                 decoration: InputDecoration(
-                  hintText: "AIzaSy...",
+                  hintText: "AIzaSy... または AQ....",
                   border: OutlineInputBorder(),
                   isDense: true,
+                  suffixIcon: IconButton(
+                    icon: Icon(Icons.content_paste, size: 20),
+                    tooltip: "貼り付け",
+                    onPressed: () async {
+                      final data =
+                          await Clipboard.getData(Clipboard.kTextPlain);
+                      if (data?.text != null) {
+                        controller.text = data!.text!.trim();
+                      }
+                    },
+                  ),
                 ),
               ),
             ],
@@ -324,20 +580,40 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
         },
       ),
       title: Text(
-        _novelStore.novelTextResponse!.text.length.toString(),
-        style: Theme.of(context).textTheme.bodyLarge,
+        (_isTranslating && _translationProgressText != null)
+            ? _translationProgressText!
+            : _novelStore.novelTextResponse!.text.length.toString(),
+        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+          fontSize: (_isTranslating && _translationProgressText != null)
+              ? 13
+              : null,
+        ),
       ),
       backgroundColor: Colors.transparent,
       actions: <Widget>[
-        IconButton(
-          icon: Icon(
-            _isShowingTranslated ? Icons.translate : Icons.g_translate,
-            color: _isShowingTranslated
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).textTheme.bodyLarge!.color,
+        GestureDetector(
+          onLongPress: _showTranslationOptionsSheet,
+          child: IconButton(
+            icon: _isTranslating
+                ? SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                  )
+                : Icon(
+                    _isShowingTranslated ? Icons.translate : Icons.g_translate,
+                    color: _isShowingTranslated
+                        ? Theme.of(context).colorScheme.primary
+                        : Theme.of(context).textTheme.bodyLarge!.color,
+                  ),
+            tooltip: _isShowingTranslated
+                ? "原文に戻す（長押しでメニュー）"
+                : "AI官能翻訳（長押しでメニュー）",
+            onPressed: () => _translateNovel(),
           ),
-          tooltip: _isShowingTranslated ? "原文に戻す" : "AI官能翻訳",
-          onPressed: _translateNovel,
         ),
         NovelBookmarkButton(novel: _novelStore.novel!),
         IconButton(
@@ -436,7 +712,11 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
               bottom: 8.0,
             ),
             child: Text(
-              "${_novelStore.novel!.title}",
+              (_isShowingTranslated &&
+                      _translatedTitle != null &&
+                      _translatedTitle!.isNotEmpty)
+                  ? _translatedTitle!
+                  : "${_novelStore.novel!.title}",
               style: Theme.of(context).textTheme.titleMedium,
             ),
           ),
@@ -503,7 +783,13 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
                   contextMenuBuilder: (context, editableTextState) {
                     return _buildSelectionMenu(editableTextState, context);
                   },
-                  child: SelectableHtml(data: _novelStore.novel?.caption ?? ""),
+                  child: SelectableHtml(
+                    data: (_isShowingTranslated &&
+                            _translatedCaption != null &&
+                            _translatedCaption!.isNotEmpty)
+                        ? _translatedCaption!
+                        : (_novelStore.novel?.caption ?? ""),
+                  ),
                 ),
               ),
               shape: RoundedRectangleBorder(
@@ -775,6 +1061,14 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
                     _export();
                   },
                 ),
+              ListTile(
+                title: Text("AI翻訳設定 / APIキー変更"),
+                leading: Icon(Icons.g_translate),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  _showTranslationOptionsSheet();
+                },
+              ),
               ListTile(
                 title: Text(I18n.of(context).setting),
                 leading: Icon(Icons.settings),
