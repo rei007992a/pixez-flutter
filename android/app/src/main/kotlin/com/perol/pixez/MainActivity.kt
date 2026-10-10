@@ -18,6 +18,9 @@ package com.perol.pixez
 
 import android.Manifest
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
 import android.content.Context
@@ -30,9 +33,12 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
 import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.documentfile.provider.DocumentFile
@@ -62,6 +68,12 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.perol.dev/save"
     private val ENCODE_CHANNEL = "samples.flutter.dev/battery"
     private val APP_WIDGET_CHANNEL = "com.perol.dev/app_widget"
+    private val TRANSLATE_BG_CHANNEL = "com.perol.dev/translate_bg"
+    private val TRANSLATE_PROGRESS_CHANNEL_ID = "pixez_translate_progress"
+    private val TRANSLATE_COMPLETE_CHANNEL_ID = "pixez_translate_complete"
+    private val TRANSLATE_PROGRESS_NOTIF_ID = 7701
+    private val TRANSLATE_COMPLETE_NOTIF_ID = 7702
+    private var translateWakeLock: PowerManager.WakeLock? = null
     private var saveMode = 0
     private val OPEN_DOCUMENT_TREE_CODE = 190
     private val PICK_IMAGE_FILE = 2
@@ -364,6 +376,193 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            TRANSLATE_BG_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    val title = call.argument<String>("title") ?: "小説"
+                    val total = call.argument<Int>("total") ?: 1
+                    startTranslateBg(title, total)
+                    result.success(true)
+                }
+
+                "progress" -> {
+                    val title = call.argument<String>("title") ?: "小説"
+                    val done = call.argument<Int>("done") ?: 0
+                    val total = call.argument<Int>("total") ?: 1
+                    val status = call.argument<String>("status") ?: ""
+                    updateTranslateBg(title, done, total, status)
+                    result.success(true)
+                }
+
+                "complete" -> {
+                    val title = call.argument<String>("title") ?: "小説"
+                    completeTranslateBg(title)
+                    result.success(true)
+                }
+
+                "stop" -> {
+                    stopTranslateBg()
+                    result.success(true)
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun ensureTranslateNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val progressChannel = NotificationChannel(
+                TRANSLATE_PROGRESS_CHANNEL_ID,
+                "AI翻訳の進捗",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "バックグラウンドで小説をAI翻訳している間の進捗を表示します"
+                setShowBadge(false)
+            }
+            val completeChannel = NotificationChannel(
+                TRANSLATE_COMPLETE_CHANNEL_ID,
+                "AI翻訳の完了通知",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "小説のAI翻訳が完了した際に通知します"
+                enableVibration(true)
+            }
+            nm.createNotificationChannel(progressChannel)
+            nm.createNotificationChannel(completeChannel)
+        }
+    }
+
+    private fun acquireTranslateWakeLock() {
+        try {
+            if (translateWakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                translateWakeLock = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "pixez:translate_wakelock"
+                ).apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (translateWakeLock?.isHeld == false) {
+                translateWakeLock?.acquire(30 * 60 * 1000L)
+            }
+        } catch (e: Throwable) {
+            Log.d("TranslateBG", "WakeLock error: ${e.message}")
+        }
+    }
+
+    private fun releaseTranslateWakeLock() {
+        try {
+            if (translateWakeLock?.isHeld == true) {
+                translateWakeLock?.release()
+            }
+        } catch (e: Throwable) {
+            Log.d("TranslateBG", "WakeLock release error: ${e.message}")
+        }
+    }
+
+    private fun buildAppLaunchPendingIntent(): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        return PendingIntent.getActivity(this, 0, intent, flags)
+    }
+
+    private fun startTranslateBg(title: String, total: Int) {
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                val granted = ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!granted) {
+                    ActivityCompat.requestPermissions(
+                        this,
+                        arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                        7700
+                    )
+                }
+            }
+            acquireTranslateWakeLock()
+            ensureTranslateNotificationChannels()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val notif = NotificationCompat.Builder(this, TRANSLATE_PROGRESS_CHANNEL_ID)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("AI翻訳を実行中: $title")
+                .setContentText("バックグラウンドで翻訳しています (0/$total)...")
+                .setProgress(total.coerceAtLeast(1), 0, true)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(buildAppLaunchPendingIntent())
+                .build()
+            nm.notify(TRANSLATE_PROGRESS_NOTIF_ID, notif)
+        } catch (e: Throwable) {
+            Log.d("TranslateBG", "start error: ${e.message}")
+        }
+    }
+
+    private fun updateTranslateBg(title: String, done: Int, total: Int, status: String) {
+        try {
+            acquireTranslateWakeLock()
+            ensureTranslateNotificationChannels()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val max = total.coerceAtLeast(1)
+            val cur = done.coerceIn(0, max)
+            val bodyText = if (status.isNotEmpty()) status else "翻訳中 ($cur/$max パート完了)"
+            val notif = NotificationCompat.Builder(this, TRANSLATE_PROGRESS_CHANNEL_ID)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("AI翻訳中 ($cur/$max): $title")
+                .setContentText(bodyText)
+                .setProgress(max, cur, false)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(buildAppLaunchPendingIntent())
+                .build()
+            nm.notify(TRANSLATE_PROGRESS_NOTIF_ID, notif)
+        } catch (e: Throwable) {
+            Log.d("TranslateBG", "update error: ${e.message}")
+        }
+    }
+
+    private fun completeTranslateBg(title: String) {
+        try {
+            releaseTranslateWakeLock()
+            ensureTranslateNotificationChannels()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(TRANSLATE_PROGRESS_NOTIF_ID)
+            val notif = NotificationCompat.Builder(this, TRANSLATE_COMPLETE_CHANNEL_ID)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("✨ AI翻訳が完了しました！")
+                .setContentText("「$title」の日本語翻訳が完了しました。タップして読む")
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setAutoCancel(true)
+                .setContentIntent(buildAppLaunchPendingIntent())
+                .build()
+            nm.notify(TRANSLATE_COMPLETE_NOTIF_ID, notif)
+        } catch (e: Throwable) {
+            Log.d("TranslateBG", "complete error: ${e.message}")
+        }
+    }
+
+    private fun stopTranslateBg() {
+        try {
+            releaseTranslateWakeLock()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(TRANSLATE_PROGRESS_NOTIF_ID)
+        } catch (e: Throwable) {
+            Log.d("TranslateBG", "stop error: ${e.message}")
         }
     }
 

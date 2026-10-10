@@ -73,8 +73,155 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
   String? _translatedCaption;
   bool _isShowingTranslated = false;
   bool _isTranslating = false;
-  bool _cancelRequested = false;
   String? _translationProgressText;
+  bool _syncedInitialTranslationState = false;
+  void Function()? _dismissLoadingToast;
+
+  void _dismissLoadingIfNeeded() {
+    if (_dismissLoadingToast != null) {
+      _dismissLoadingToast!();
+      _dismissLoadingToast = null;
+    }
+  }
+
+  /// 原作・キャラクター口調・固有名詞を正確に再現するためのメタ情報を構築
+  String _buildNovelContext() {
+    final novel = _novelStore.novel;
+    if (novel == null) return '';
+    final buffer = StringBuffer();
+    buffer.writeln('作品タイトル: ${novel.title}');
+    if (novel.series.title != null && novel.series.title!.trim().isNotEmpty) {
+      buffer.writeln('シリーズ名: ${novel.series.title}');
+    }
+    buffer.writeln('作者名: ${novel.user.name}');
+    if (novel.tags.isNotEmpty) {
+      final tagDescriptions = novel.tags.map((t) {
+        final jp = t.translatedName;
+        if (jp != null && jp.trim().isNotEmpty && jp.trim() != t.name.trim()) {
+          return '${t.name} (日本語公式表記: $jp)';
+        }
+        return t.name;
+      }).join(' / ');
+      buffer.writeln('登録タグ（原作名・登場キャラ・カップリング・属性）: $tagDescriptions');
+    }
+    return buffer.toString().trim();
+  }
+
+  List<NovelSpansData> _buildSpansFromText(String text) {
+    final clonedMap =
+        jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
+    final translatedResponse = NovelWebResponse.fromJson(clonedMap);
+    translatedResponse.text = text;
+    return novelSpansGenerator.buildSpans(translatedResponse);
+  }
+
+  void _syncExistingTranslationStateIfNeeded() {
+    if (_syncedInitialTranslationState) return;
+    if (_novelStore.novelTextResponse == null || _novelStore.novel == null) {
+      return;
+    }
+    _syncedInitialTranslationState = true;
+
+    final cachedBody = GeminiTranslator.getCachedBody(widget.id);
+    final isRunning = GeminiTranslator.isTranslatingNovel(widget.id);
+    if (cachedBody == null && !isRunning) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _originalSpans ??= List.from(_novelStore.spans);
+      final cTitle = GeminiTranslator.getCachedTitle(widget.id);
+      final cCaption = GeminiTranslator.getCachedCaption(widget.id);
+
+      if (cachedBody != null) {
+        final spans = _buildSpansFromText(cachedBody);
+        setState(() {
+          _translatedTitle = cTitle;
+          _translatedCaption = cCaption;
+          _translatedSpans = spans;
+          _isShowingTranslated = true;
+          _isTranslating = false;
+          _translationProgressText = null;
+          _novelStore.spans = spans;
+        });
+      } else if (isRunning) {
+        final partial = GeminiTranslator.getPartialBody(widget.id);
+        final status = GeminiTranslator.getJobStatus(widget.id) ?? 'AI翻訳中...';
+        GeminiTranslator.attachUiListener(
+          widget.id,
+          _onBackgroundTranslationUpdate,
+        );
+        setState(() {
+          _translatedTitle = cTitle;
+          _translatedCaption = cCaption;
+          _isTranslating = true;
+          _translationProgressText = status;
+          if (partial != null && partial.isNotEmpty) {
+            final spans = _buildSpansFromText(partial);
+            _translatedSpans = spans;
+            _isShowingTranslated = true;
+            _novelStore.spans = spans;
+          }
+        });
+      }
+    });
+  }
+
+  void _onBackgroundTranslationUpdate(
+    int completed,
+    int total,
+    String currentFullText,
+    String statusMessage,
+    bool isFinished,
+    Object? error,
+  ) {
+    if (!mounted) return;
+
+    final cTitle = GeminiTranslator.getCachedTitle(widget.id);
+    final cCaption = GeminiTranslator.getCachedCaption(widget.id);
+    if (cTitle != null) _translatedTitle = cTitle;
+    if (cCaption != null) _translatedCaption = cCaption;
+
+    if (error != null) {
+      _dismissLoadingIfNeeded();
+      final errMsg = error.toString().replaceFirst('Exception: ', '');
+      setState(() {
+        _isTranslating = false;
+        _translationProgressText = null;
+      });
+      BotToast.showText(text: "翻訳失敗: $errMsg");
+      GeminiTranslator.getApiKey().then((apiKey) {
+        if (mounted) {
+          _showTranslationErrorDialog(errMsg, apiKey);
+        }
+      });
+      return;
+    }
+
+    if (completed > 0 || isFinished) {
+      _dismissLoadingIfNeeded();
+      final newSpans = _buildSpansFromText(currentFullText);
+      setState(() {
+        _translatedSpans = newSpans;
+        _isShowingTranslated = true;
+        _isTranslating = !isFinished;
+        _translationProgressText = isFinished ? null : statusMessage;
+        _novelStore.spans = _translatedSpans!;
+      });
+
+      if (completed == 1 && total > 1 && !isFinished) {
+        BotToast.showText(
+          text: "冒頭の翻訳が完了しました！他アプリ操作中もバックグラウンドで継続し完了時に通知します",
+        );
+      } else if (isFinished) {
+        BotToast.showText(text: "全文の日本語翻訳が完了しました！");
+      }
+    } else {
+      setState(() {
+        _isTranslating = true;
+        _translationProgressText = statusMessage;
+      });
+    }
+  }
 
   Future<void> _translateNovel({bool forceRetranslate = false}) async {
     if (_isTranslating) {
@@ -102,136 +249,60 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
     }
 
     if (forceRetranslate) {
+      GeminiTranslator.cancelNovelJob(widget.id);
       await GeminiTranslator.clearCache();
       _translatedSpans = null;
       _translatedTitle = null;
       _translatedCaption = null;
     }
 
+    _originalSpans ??= List.from(_novelStore.spans);
+
     setState(() {
       _isTranslating = true;
-      _cancelRequested = false;
       _translationProgressText = "AI翻訳を開始中...";
     });
 
-    final cancelToast = BotToast.showLoading();
-    bool loadingDismissed = false;
-    void dismissLoadingIfNeeded() {
-      if (!loadingDismissed) {
-        cancelToast();
-        loadingDismissed = true;
-      }
-    }
+    _dismissLoadingIfNeeded();
+    _dismissLoadingToast = BotToast.showLoading();
 
     try {
-      _originalSpans ??= List.from(_novelStore.spans);
-
-      // 1. タイトルとキャプション（あらすじカード）を最優先で翻訳して画面に即座に反映
       final rawTitle = _novelStore.novel?.title ?? "";
       final rawCaption = _novelStore.novel?.caption ?? "";
-      if (_translatedTitle == null &&
-          (rawTitle.isNotEmpty || rawCaption.isNotEmpty)) {
-        try {
-          if (mounted) {
-            setState(() {
-              _translationProgressText = "タイトル・あらすじを翻訳中...";
-            });
-          }
-          final headerSource = "【TITLE】\n$rawTitle\n【CAPTION】\n$rawCaption";
-          final translatedHeader =
-              await GeminiTranslator.translateText(headerSource);
-          final captionIdx = translatedHeader.indexOf("【CAPTION】");
-          if (captionIdx != -1) {
-            _translatedTitle = translatedHeader
-                .substring(0, captionIdx)
-                .replaceFirst("【TITLE】", "")
-                .trim();
-            _translatedCaption = translatedHeader
-                .substring(captionIdx + "【CAPTION】".length)
-                .trim();
-          } else {
-            _translatedTitle = translatedHeader
-                .replaceFirst("【TITLE】", "")
-                .trim();
-          }
-          if (mounted && !_cancelRequested) {
-            dismissLoadingIfNeeded();
-            setState(() {
-              _isShowingTranslated = true;
-            });
-          }
-        } catch (headerErr) {
-          LPrinter.d("Header translation skipped or deferred: $headerErr");
-        }
-      }
-
-      // 2. 本文をチャンクごとに順次ストリーミング翻訳（第1パート完了時点で即座に読めるようにする）
       final fullText = _novelStore.novelTextResponse!.text;
-      final translatedText = await GeminiTranslator.translateNovelProgressive(
-        fullText,
+      final novelContext = _buildNovelContext();
+
+      await GeminiTranslator.startBackgroundNovelTranslation(
         novelId: widget.id,
-        isCancelled: () => !mounted || _cancelRequested,
-        onChunkTranslated: (completed, total, partialFullText, statusMessage) {
-          if (!mounted || _cancelRequested) return;
-
-          if (completed > 0) {
-            dismissLoadingIfNeeded();
-
-            final clonedMap =
-                jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
-            final translatedResponse = NovelWebResponse.fromJson(clonedMap);
-            translatedResponse.text = partialFullText;
-            final newSpans = novelSpansGenerator.buildSpans(translatedResponse);
-
-            setState(() {
-              _translatedSpans = newSpans;
-              _isShowingTranslated = true;
-              _translationProgressText = statusMessage;
-              _novelStore.spans = _translatedSpans!;
-            });
-
-            if (completed == 1 && total > 1) {
-              BotToast.showText(
-                text: "冒頭の翻訳が完了しました！読み進めている間に残りを自動翻訳します",
-              );
+        rawText: fullText,
+        rawTitle: rawTitle,
+        rawCaption: rawCaption,
+        novelContext: novelContext,
+        onHeaderTranslated: (tTitle, tCaption) {
+          if (!mounted) return;
+          _dismissLoadingIfNeeded();
+          setState(() {
+            if (tTitle != null && tTitle.isNotEmpty) {
+              _translatedTitle = tTitle;
             }
-          } else {
-            setState(() {
-              _translationProgressText = statusMessage;
-            });
-          }
+            if (tCaption != null && tCaption.isNotEmpty) {
+              _translatedCaption = tCaption;
+            }
+            _isShowingTranslated = true;
+          });
         },
+        onUiUpdate: _onBackgroundTranslationUpdate,
       );
-
-      if (mounted && !_cancelRequested) {
-        final clonedMap =
-            jsonDecode(jsonEncode(_novelStore.novelTextResponse!.toJson()));
-        final translatedResponse = NovelWebResponse.fromJson(clonedMap);
-        translatedResponse.text = translatedText;
-        _translatedSpans = novelSpansGenerator.buildSpans(translatedResponse);
-
-        setState(() {
-          _isShowingTranslated = true;
-          _translationProgressText = null;
-          _novelStore.spans = _translatedSpans!;
-        });
-
-        BotToast.showText(text: "全文の日本語官能翻訳が完了しました！");
-      }
     } catch (e) {
-      dismissLoadingIfNeeded();
+      _dismissLoadingIfNeeded();
       final errMsg = e.toString().replaceFirst('Exception: ', '');
-      BotToast.showText(text: "翻訳失敗: $errMsg");
-      if (mounted) {
-        _showTranslationErrorDialog(errMsg, apiKey);
-      }
-    } finally {
-      dismissLoadingIfNeeded();
       if (mounted) {
         setState(() {
           _isTranslating = false;
           _translationProgressText = null;
         });
+        BotToast.showText(text: "翻訳失敗: $errMsg");
+        _showTranslationErrorDialog(errMsg, apiKey);
       }
     }
   }
@@ -312,10 +383,10 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
             children: [
               ListTile(
                 leading: Icon(Icons.translate),
-                title: Text("AI官能翻訳メニュー"),
+                title: Text("AI小説翻訳メニュー（バックグラウンド対応）"),
                 subtitle: Text(
                   _isTranslating
-                      ? (_translationProgressText ?? "翻訳中...")
+                      ? "${_translationProgressText ?? "翻訳中..."}（他アプリ操作中も継続・完了時通知）"
                       : "現在のAPIキー: $maskedKey",
                 ),
               ),
@@ -339,11 +410,12 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
               if (_isTranslating)
                 ListTile(
                   leading: Icon(Icons.stop_circle_outlined, color: Colors.red),
-                  title: Text("翻訳を中断する"),
+                  title: Text("バックグラウンド翻訳を中断する"),
                   onTap: () {
                     Navigator.pop(context);
+                    _dismissLoadingIfNeeded();
+                    GeminiTranslator.cancelNovelJob(widget.id);
                     setState(() {
-                      _cancelRequested = true;
                       _isTranslating = false;
                       _translationProgressText = null;
                     });
@@ -460,6 +532,9 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
 
   @override
   void dispose() {
+    _dismissLoadingIfNeeded();
+    // 画面を離れてもバックグラウンド翻訳自体は継続させ、UIリスナーのみ解除
+    GeminiTranslator.attachUiListener(widget.id, null);
     _offsetDisposer?.call();
     if (_novelStore.positionBooked) {
       _novelStore.bookPosition(_localOffset);
@@ -479,14 +554,18 @@ class _NovelViewerPageState extends State<NovelViewerPage> {
       builder: (context) {
         _textStyle = Theme.of(
           context,
-        ).textTheme.bodyLarge!.copyWith(fontSize: userSetting.novelFontsize);
+        ).textTheme.bodyLarge!.copyWith(
+          fontSize: userSetting.novelFontsize,
+          height: 1.75,
+        );
         if (_novelStore.errorMessage != null) {
           return _buildErrorContent(context);
         }
         if (_novelStore.novelTextResponse != null &&
             _novelStore.novel != null) {
+          _syncExistingTranslationStateIfNeeded();
           _textStyle =
-              _textStyle ?? Theme.of(context).textTheme.bodyLarge!.copyWith();
+              _textStyle ?? Theme.of(context).textTheme.bodyLarge!.copyWith(height: 1.75);
           if (_controller == null) {
             LPrinter.d("init Controller ${_novelStore.bookedOffset}");
             _controller = ScrollController(
