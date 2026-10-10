@@ -65,14 +65,68 @@ class GeminiTranslator {
     return translatedChunks.join('\n\n');
   }
 
+  static String? _cachedWorkingModel;
+
+  /// 利用可能なモデル一覧をGoogle APIから自動取得
+  static Future<List<String>> _getAvailableModels(String apiKey) async {
+    if (_cachedWorkingModel != null) {
+      return [_cachedWorkingModel!];
+    }
+
+    try {
+      final listUrl =
+          'https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey';
+      final response = await _dio.get(
+        listUrl,
+        options: Options(
+          headers: {'x-goog-api-key': apiKey},
+          sendTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+        ),
+      );
+
+      if (response.statusCode == 200 && response.data != null) {
+        final modelsList = response.data['models'] as List?;
+        if (modelsList != null) {
+          final matched = <String>[];
+          for (final m in modelsList) {
+            final name = m['name'] as String? ?? '';
+            final methods = m['supportedGenerationMethods'] as List? ?? [];
+            if (methods.contains('generateContent')) {
+              final cleanName = name.replaceFirst('models/', '');
+              matched.add(cleanName);
+            }
+          }
+          if (matched.isNotEmpty) {
+            // flashモデルを最優先（降順ソートで最新モデルが先頭に）
+            matched.sort((a, b) {
+              final aFlash = a.contains('flash');
+              final bFlash = b.contains('flash');
+              if (aFlash && !bFlash) return -1;
+              if (!aFlash && bFlash) return 1;
+              return b.compareTo(a);
+            });
+            return matched;
+          }
+        }
+      }
+    } catch (_) {
+      // 取得失敗時は静的フォールバック
+    }
+
+    return [
+      'gemini-2.5-flash',
+      'gemini-3.5-flash',
+      'gemini-3.8-flash',
+      'gemini-1.5-flash-latest',
+      'gemini-1.5-flash',
+      'gemini-2.0-flash-exp',
+    ];
+  }
+
   /// 1チャンクをGemini APIに送信して翻訳
   static Future<String> _translateChunk(String chunk, String apiKey) async {
-    final models = [
-      'gemini-3.8-flash',
-      'gemini-2.5-flash',
-      'gemini-1.5-flash',
-    ];
-
+    final models = await _getAvailableModels(apiKey);
     dynamic lastException;
 
     for (final model in models) {
@@ -121,7 +175,10 @@ class GeminiTranslator {
           url,
           data: requestBody,
           options: Options(
-            headers: {'Content-Type': 'application/json'},
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey,
+            },
             sendTimeout: const Duration(seconds: 40),
             receiveTimeout: const Duration(seconds: 60),
           ),
@@ -134,6 +191,7 @@ class GeminiTranslator {
             final content = candidates[0]['content'];
             final parts = content['parts'] as List?;
             if (parts != null && parts.isNotEmpty) {
+              _cachedWorkingModel = model;
               return parts[0]['text'] as String;
             }
           }
@@ -142,14 +200,8 @@ class GeminiTranslator {
         if (e.response != null && e.response?.data != null) {
           final err = e.response?.data;
           final msg = err['error']?['message'] ?? e.message;
-          // もしモデルが見つからない系のエラーなら次のモデルを試す
-          if (msg.toString().contains('no longer available') ||
-              msg.toString().contains('not found') ||
-              e.response?.statusCode == 404) {
-            lastException = Exception('Gemini API エラー: $msg');
-            continue;
-          }
-          throw Exception('Gemini API エラー: $msg');
+          lastException = Exception('Gemini API エラー ($model): $msg');
+          continue;
         }
         lastException = e;
       } catch (e) {
