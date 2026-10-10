@@ -67,79 +67,97 @@ class GeminiTranslator {
 
   /// 1チャンクをGemini APIに送信して翻訳
   static Future<String> _translateChunk(String chunk, String apiKey) async {
-    // gemini-2.0-flash または gemini-1.5-flash
-    final url =
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey';
+    final models = [
+      'gemini-3.8-flash',
+      'gemini-2.5-flash',
+      'gemini-1.5-flash',
+    ];
 
-    final requestBody = {
-      "contents": [
-        {
-          "role": "user",
-          "parts": [
-            {
-              "text":
-                  "$_systemInstruction\n\n【以下の中国語小説テキストを日本語に翻訳してください】\n$chunk"
+    dynamic lastException;
+
+    for (final model in models) {
+      final url =
+          'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey';
+
+      final requestBody = {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text":
+                    "$_systemInstruction\n\n【以下の中国語小説テキストを日本語に翻訳してください】\n$chunk"
+              }
+            ]
+          }
+        ],
+        "generationConfig": {
+          "temperature": 0.4,
+          "maxOutputTokens": 8192,
+        },
+        // セーフティフィルターをすべて完全無効化（官能描写をブロックさせない）
+        "safetySettings": [
+          {
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "threshold": "BLOCK_NONE"
+          },
+          {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": "BLOCK_NONE"
+          },
+          {
+            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "threshold": "BLOCK_NONE"
+          },
+          {
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": "BLOCK_NONE"
+          }
+        ]
+      };
+
+      try {
+        final response = await _dio.post(
+          url,
+          data: requestBody,
+          options: Options(
+            headers: {'Content-Type': 'application/json'},
+            sendTimeout: const Duration(seconds: 40),
+            receiveTimeout: const Duration(seconds: 60),
+          ),
+        );
+
+        if (response.statusCode == 200) {
+          final data = response.data;
+          final candidates = data['candidates'] as List?;
+          if (candidates != null && candidates.isNotEmpty) {
+            final content = candidates[0]['content'];
+            final parts = content['parts'] as List?;
+            if (parts != null && parts.isNotEmpty) {
+              return parts[0]['text'] as String;
             }
-          ]
-        }
-      ],
-      "generationConfig": {
-        "temperature": 0.4,
-        "maxOutputTokens": 8192,
-      },
-      // セーフティフィルターをすべて完全無効化（官能描写をブロックさせない）
-      "safetySettings": [
-        {
-          "category": "HARM_CATEGORY_HARASSMENT",
-          "threshold": "BLOCK_NONE"
-        },
-        {
-          "category": "HARM_CATEGORY_HATE_SPEECH",
-          "threshold": "BLOCK_NONE"
-        },
-        {
-          "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-          "threshold": "BLOCK_NONE"
-        },
-        {
-          "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-          "threshold": "BLOCK_NONE"
-        }
-      ]
-    };
-
-    try {
-      final response = await _dio.post(
-        url,
-        data: requestBody,
-        options: Options(
-          headers: {'Content-Type': 'application/json'},
-          sendTimeout: const Duration(seconds: 40),
-          receiveTimeout: const Duration(seconds: 60),
-        ),
-      );
-
-      if (response.statusCode == 200) {
-        final data = response.data;
-        final candidates = data['candidates'] as List?;
-        if (candidates != null && candidates.isNotEmpty) {
-          final content = candidates[0]['content'];
-          final parts = content['parts'] as List?;
-          if (parts != null && parts.isNotEmpty) {
-            return parts[0]['text'] as String;
           }
         }
-        throw Exception('翻訳結果が取得できませんでした。');
-      } else {
-        throw Exception('APIエラー: ${response.statusCode} ${response.statusMessage}');
+      } on DioException catch (e) {
+        if (e.response != null && e.response?.data != null) {
+          final err = e.response?.data;
+          final msg = err['error']?['message'] ?? e.message;
+          // もしモデルが見つからない系のエラーなら次のモデルを試す
+          if (msg.toString().contains('no longer available') ||
+              msg.toString().contains('not found') ||
+              e.response?.statusCode == 404) {
+            lastException = Exception('Gemini API エラー: $msg');
+            continue;
+          }
+          throw Exception('Gemini API エラー: $msg');
+        }
+        lastException = e;
+      } catch (e) {
+        lastException = e;
       }
-    } on DioException catch (e) {
-      if (e.response != null && e.response?.data != null) {
-        final err = e.response?.data;
-        throw Exception('Gemini API エラー: ${err['error']?['message'] ?? e.message}');
-      }
-      throw Exception('通信エラー: ${e.message}');
     }
+
+    throw lastException ?? Exception('Gemini API で翻訳結果が取得できませんでした。');
   }
 
   /// 改行を意識して適切なサイズに分割する
