@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:easy_refresh/easy_refresh.dart';
 import 'package:material_ui/material_ui.dart';
@@ -28,12 +29,15 @@ class NovelResultPage extends StatefulWidget {
 }
 
 class _NovelResultPageState extends State<NovelResultPage> {
+  late String _currentWord;
+
   @override
   void initState() {
     super.initState();
+    _currentWord = widget.word.trim();
     tagHistoryStore.insert(
       TagsPersist(
-        name: widget.word,
+        name: _currentWord,
         translatedName: widget.translatedName ?? "",
       ),
     );
@@ -43,14 +47,41 @@ class _NovelResultPageState extends State<NovelResultPage> {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => Scaffold(
-          appBar: AppBar(title: Text('${widget.word} - ${I18n.of(context).painter}')),
+          appBar: AppBar(
+            title: Text('$_currentWord - ${I18n.of(context).painter}'),
+          ),
           body: PainterList(
-            futureGet: () => apiClient.getSearchUser(widget.word),
+            futureGet: () => apiClient.getSearchUser(_currentWord),
             isNovel: true,
           ),
         ),
       ),
     );
+  }
+
+  Future<void> _openSearchWordEditor() async {
+    HapticUtil.selectionClick();
+    final updatedWord = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (context) => _NovelSearchWordEditorPage(
+          initialWord: _currentWord,
+        ),
+      ),
+    );
+    if (updatedWord != null &&
+        updatedWord.trim().isNotEmpty &&
+        updatedWord.trim() != _currentWord) {
+      final clean = updatedWord.trim();
+      tagHistoryStore.insert(
+        TagsPersist(
+          name: clean,
+          translatedName: "",
+        ),
+      );
+      setState(() {
+        _currentWord = clean;
+      });
+    }
   }
 
   @override
@@ -59,7 +90,48 @@ class _NovelResultPageState extends State<NovelResultPage> {
       length: 2,
       child: Scaffold(
         appBar: AppBar(
-          title: Text(widget.word),
+          titleSpacing: 4,
+          title: InkWell(
+            onTap: _openSearchWordEditor,
+            borderRadius: BorderRadius.circular(22),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              decoration: BoxDecoration(
+                color: Theme.of(context)
+                    .colorScheme
+                    .surfaceContainerHighest
+                    .withAlpha(130),
+                borderRadius: BorderRadius.circular(22),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.search,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _currentWord,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontSize: 15,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Icon(
+                    Icons.add_circle_outline,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ],
+              ),
+            ),
+          ),
           actions: [
             IconButton(
               icon: Icon(Icons.person_search),
@@ -79,10 +151,414 @@ class _NovelResultPageState extends State<NovelResultPage> {
         ),
         body: TabBarView(
           children: [
-            NovelResultList(word: widget.word),
-            NovelKeywordRankingView(word: widget.word),
+            NovelResultList(
+              key: ValueKey('novel_list_$_currentWord'),
+              word: _currentWord,
+            ),
+            NovelKeywordRankingView(
+              key: ValueKey('novel_rank_$_currentWord'),
+              word: _currentWord,
+            ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// 上部の検索バーをタップした際に検索ワードを追加・編集できるページ
+class _NovelSearchWordEditorPage extends StatefulWidget {
+  final String initialWord;
+
+  const _NovelSearchWordEditorPage({Key? key, required this.initialWord})
+    : super(key: key);
+
+  @override
+  State<_NovelSearchWordEditorPage> createState() =>
+      _NovelSearchWordEditorPageState();
+}
+
+class _NovelSearchWordEditorPageState
+    extends State<_NovelSearchWordEditorPage> {
+  late TextEditingController _controller;
+  final FocusNode _focusNode = FocusNode();
+  Timer? _debounce;
+  List<Tags> _autoCompleteTags = [];
+  List<String> _relatedTags = [];
+  bool _loadingRelated = true;
+
+  @override
+  void initState() {
+    super.initState();
+    final initClean = widget.initialWord.trim();
+    // すぐに追加ワードを入力できるよう末尾に半角スペースを付与してカーソルを末尾に配置
+    final initialText = initClean.isEmpty ? '' : '$initClean ';
+    _controller = TextEditingController(text: initialText);
+    _controller.selection = TextSelection.fromPosition(
+      TextPosition(offset: _controller.text.length),
+    );
+    tagHistoryStore.fetch();
+    _loadRelatedTagsFromNovels(initClean);
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _controller.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  List<String> get _currentWordTokens {
+    return _controller.text
+        .split(RegExp(r'[\s　]+'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+  }
+
+  Future<void> _loadRelatedTagsFromNovels(String baseWord) async {
+    if (baseWord.isEmpty) {
+      if (mounted) setState(() => _loadingRelated = false);
+      return;
+    }
+    try {
+      final freq = <String, int>{};
+      final existing = baseWord
+          .split(RegExp(r'[\s　]+'))
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toSet();
+
+      final responses = await Future.wait<Response?>([
+        apiClient.getPopularPreviewNovel(baseWord).catchError((_) => Response(requestOptions: RequestOptions(path: ''))),
+        apiClient.getSearchNovel(baseWord).catchError((_) => Response(requestOptions: RequestOptions(path: ''))),
+      ]);
+
+      for (final res in responses) {
+        if (res?.data != null && res!.data['novels'] is List) {
+          final novels = NovelRecomResponse.fromJson(res.data).novels;
+          for (final n in novels) {
+            for (final t in n.tags) {
+              final name = t.name.trim();
+              if (name.isEmpty || existing.contains(name)) continue;
+              freq[name] = (freq[name] ?? 0) + 1;
+            }
+          }
+        }
+      }
+
+      final sorted = freq.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      if (mounted) {
+        setState(() {
+          _relatedTags = sorted.take(24).map((e) => e.key).toList();
+          _loadingRelated = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _loadingRelated = false);
+      }
+    }
+  }
+
+  void _onTextChanged(String value) {
+    setState(() {});
+    _debounce?.cancel();
+
+    // 末尾が空白でない場合、現在入力中の最後の単語に対してPixiv公式オートコンプリートを実行
+    if (value.isEmpty || value.endsWith(' ') || value.endsWith('　')) {
+      setState(() {
+        _autoCompleteTags = [];
+      });
+      return;
+    }
+
+    final tokens = value
+        .split(RegExp(r'[\s　]+'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+    if (tokens.isEmpty) return;
+    final lastWord = tokens.last;
+    if (lastWord.isEmpty) return;
+
+    _debounce = Timer(const Duration(milliseconds: 220), () async {
+      try {
+        final autoWords = await apiClient.getSearchAutoCompleteKeywords(lastWord);
+        if (mounted) {
+          setState(() {
+            _autoCompleteTags = autoWords.tags;
+          });
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _appendOrToggleTag(String tag) {
+    HapticUtil.selectionClick();
+    final tokens = _currentWordTokens;
+    if (tokens.contains(tag)) {
+      tokens.remove(tag);
+    } else {
+      tokens.add(tag);
+    }
+    final nextText = tokens.isEmpty ? '' : '${tokens.join(' ')} ';
+    setState(() {
+      _controller.text = nextText;
+      _controller.selection = TextSelection.fromPosition(
+        TextPosition(offset: _controller.text.length),
+      );
+      _autoCompleteTags = [];
+    });
+    _focusNode.requestFocus();
+  }
+
+  void _replaceLastTokenWithSuggestion(String suggestedTag, {bool submitNow = false}) {
+    HapticUtil.selectionClick();
+    final tokens = _currentWordTokens;
+    if (tokens.isEmpty) {
+      tokens.add(suggestedTag);
+    } else {
+      tokens[tokens.length - 1] = suggestedTag;
+    }
+    final nextText = '${tokens.join(' ')} ';
+    if (submitNow) {
+      Navigator.of(context).pop(tokens.join(' '));
+      return;
+    }
+    setState(() {
+      _controller.text = nextText;
+      _controller.selection = TextSelection.fromPosition(
+        TextPosition(offset: _controller.text.length),
+      );
+      _autoCompleteTags = [];
+    });
+    _focusNode.requestFocus();
+  }
+
+  void _submitSearch() {
+    final query = _currentWordTokens.join(' ').trim();
+    if (query.isEmpty) return;
+    Navigator.of(context).pop(query);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tokens = _currentWordTokens;
+    final historyTags = tagHistoryStore.tags
+        .map((e) => e.name.trim())
+        .where((name) => name.isNotEmpty && !tokens.contains(name))
+        .toSet()
+        .take(15)
+        .toList();
+
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 0,
+        title: TextField(
+          controller: _controller,
+          focusNode: _focusNode,
+          autofocus: true,
+          textInputAction: TextInputAction.search,
+          onChanged: _onTextChanged,
+          onSubmitted: (_) => _submitSearch(),
+          style: Theme.of(context).textTheme.titleMedium,
+          decoration: const InputDecoration(
+            hintText: 'スペース区切りで検索ワードを追加...',
+            border: InputBorder.none,
+          ),
+        ),
+        actions: [
+          if (_controller.text.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.backspace_outlined, size: 20),
+              tooltip: 'クリア',
+              onPressed: () {
+                setState(() {
+                  _controller.clear();
+                  _autoCompleteTags = [];
+                });
+                _focusNode.requestFocus();
+              },
+            ),
+          Padding(
+            padding: const EdgeInsets.only(right: 8.0),
+            child: FilledButton.icon(
+              onPressed: tokens.isEmpty ? null : _submitSearch,
+              icon: const Icon(Icons.search, size: 18),
+              label: const Text('検索'),
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        children: [
+          // 1. 現在の検索タグ（タップや×で個別に削除可能）
+          if (tokens.isNotEmpty) ...[
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  '現在の検索ワード（×で個別削除）',
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: Theme.of(context).colorScheme.primary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: () {
+                    if (!_controller.text.endsWith(' ')) {
+                      setState(() {
+                        _controller.text = '${_controller.text} ';
+                        _controller.selection = TextSelection.fromPosition(
+                          TextPosition(offset: _controller.text.length),
+                        );
+                      });
+                    }
+                    _focusNode.requestFocus();
+                  },
+                  icon: const Icon(Icons.space_bar, size: 16),
+                  label: const Text('スペース追加', style: TextStyle(fontSize: 12)),
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+              ],
+            ),
+            Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: [
+                for (final t in tokens)
+                  InputChip(
+                    label: Text(t, style: const TextStyle(fontSize: 13)),
+                    onDeleted: () => _appendOrToggleTag(t),
+                    visualDensity: VisualDensity.compact,
+                  ),
+              ],
+            ),
+            const Divider(height: 20),
+          ],
+
+          // 2. 入力中のPixiv公式タグ予測変換候補
+          if (_autoCompleteTags.isNotEmpty) ...[
+            Text(
+              'タグ予測候補（タップで追加して検索 ／ 右の＋で入力欄に追加のみ）',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: Theme.of(context).colorScheme.secondary,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (final tag in _autoCompleteTags.take(10))
+                    ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.tag, size: 18),
+                      title: Text(tag.name),
+                      subtitle: (tag.translated_name != null &&
+                              tag.translated_name!.isNotEmpty)
+                          ? Text(tag.translated_name!)
+                          : null,
+                      onTap: () => _replaceLastTokenWithSuggestion(
+                        tag.name,
+                        submitNow: true,
+                      ),
+                      trailing: IconButton(
+                        icon: Icon(
+                          Icons.add_circle_outline,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        tooltip: '入力欄に追加してさらに絞り込む',
+                        onPressed: () => _replaceLastTokenWithSuggestion(
+                          tag.name,
+                          submitNow: false,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+
+          // 3. ワンタップで追加できる関連タグ・人気タグ
+          Text(
+            '＋ ワンタップで検索ワードを追加（関連タグ・人気条件）',
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final preset in const ['R-18', 'R-18G', '1000users入り', '5000users入り'])
+                if (!tokens.contains(preset))
+                  ActionChip(
+                    avatar: const Icon(Icons.add, size: 15),
+                    label: Text(preset, style: const TextStyle(fontSize: 12)),
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => _appendOrToggleTag(preset),
+                  ),
+              for (final rel in _relatedTags)
+                if (!tokens.contains(rel))
+                  ActionChip(
+                    avatar: const Icon(Icons.add, size: 15),
+                    label: Text(rel, style: const TextStyle(fontSize: 12)),
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => _appendOrToggleTag(rel),
+                  ),
+            ],
+          ),
+          if (_loadingRelated)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: Center(
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            ),
+
+          // 4. 検索履歴から追加
+          if (historyTags.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Text(
+              '＋ 検索履歴からワードを追加',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final h in historyTags)
+                  ActionChip(
+                    avatar: const Icon(Icons.history, size: 15),
+                    label: Text(h, style: const TextStyle(fontSize: 12)),
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => _appendOrToggleTag(h),
+                  ),
+              ],
+            ),
+          ],
+        ],
       ),
     );
   }
