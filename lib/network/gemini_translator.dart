@@ -702,16 +702,23 @@ class GeminiTranslator {
     void Function(String status)? onStatus,
   }) async {
     final stage1Input = _preprocessStage1(chunk);
-    final sysPrompt1 = _buildSystemPromptStage1(novelContext, isHeader: isHeader);
-    final prompt1 = '$sysPrompt1\n\n【翻訳対象の原文】\n$stage1Input';
+
+    // ハイブリッド直球翻訳方式:
+    // 原文の直接的な部位表現・スラングを記号トークンに事前分離してAIに渡し、
+    // AIには「キャラの原作口調と自然な小説文体」を作らせた上で、プログラム側で100%直球の語彙・スラングに強制復元する
+    final normalizedForHybrid = _normalizeTradForPreprocess(stage1Input);
+    final hybridInput = _preprocessStage2Stealth(normalizedForHybrid);
+    final sysPromptHybrid = _buildSystemPromptStage1(novelContext, isHeader: isHeader);
+    final promptHybrid = '$sysPromptHybrid\n※文中の二重山括弧《...》で囲まれた語句は、翻訳後の文脈の該当位置に一文字も変えずそのまま残すこと。\n\n【翻訳対象の原文】\n$hybridInput';
 
     try {
       final res = await _callGeminiModelsWithRateLimitRetry(
-        prompt1,
+        promptHybrid,
         apiKey,
         onStatus: onStatus,
       );
-      final post1 = _postprocessStage1(res, chunk);
+      final unmasked = _postprocessStage2Stealth(res, rawSource: chunk);
+      final post1 = _enforceDirectVocabulary(_postprocessStage1(unmasked, chunk), chunk);
       if (_isValidJapaneseTranslation(post1, chunk)) {
         return post1;
       }
@@ -724,20 +731,18 @@ class GeminiTranslator {
         rethrow;
       }
 
-      // 第2段階（ステルス検閲回避モード）で再試行
+      // フォールバック: 第2段階プロンプトで再試行
       onStatus?.call('高精度モードで翻訳中...');
       try {
-        final normalizedForStealth = _normalizeTradForPreprocess(stage1Input);
-        final stealthInput = _preprocessStage2Stealth(normalizedForStealth);
         final sysPrompt2 = _buildSystemPromptStage2(novelContext);
-        final prompt2 = '$sysPrompt2\n\n【翻訳対象の原文】\n$stealthInput';
+        final prompt2 = '$sysPrompt2\n\n【翻訳対象の原文】\n$hybridInput';
         final res2 = await _callGeminiModelsWithRateLimitRetry(
           prompt2,
           apiKey,
           onStatus: onStatus,
         );
-        final unmasked = _postprocessStage2Stealth(res2);
-        final post2 = _postprocessStage1(unmasked, chunk);
+        final unmasked2 = _postprocessStage2Stealth(res2, rawSource: chunk);
+        final post2 = _enforceDirectVocabulary(_postprocessStage1(unmasked2, chunk), chunk);
         if (_isValidJapaneseTranslation(post2, chunk)) {
           return post2;
         }
@@ -954,7 +959,7 @@ class GeminiTranslator {
   }
 
   /// 第2段階ポストプロセス: 暗号トークンを日本の官能小説表現に復元
-  static String _postprocessStage2Stealth(String text) {
+  static String _postprocessStage2Stealth(String text, {String? rawSource}) {
     String out = text;
     final restoreMap = <String, String>{
       '《奉仕の器》': '肉便器',
@@ -1008,12 +1013,54 @@ class GeminiTranslator {
       '《言葉巧みに抱く》': 'セフレにする',
       '《激しく抜き差し》': 'ピストン',
       '《激しく貫く》': '犯す',
-      '《秘所》': '秘部',
-      '《激しい交わり》': 'セックス',
-      '《濃密な交わり》': '情事',
+      '《秘所》': '\u30de\u30f3\u30b3',
+      '《激しい交わり》': '\u30bb\u30c3\u30af\u30b9',
+      '《濃密な交わり》': '\u30d5\u30a1\u30c3\u30af',
     };
     restoreMap.forEach((k, v) {
       out = out.replaceAll(k, v);
+    });
+    if (rawSource != null && rawSource.isNotEmpty) {
+      out = _enforceDirectVocabulary(out, rawSource);
+    }
+    return out;
+  }
+
+  /// AIが勝手にマイルド化・学術用語化した表現を、原文のスラング度合いに応じて直球表現へ強制変換するポストプロセッサ
+  static String _enforceDirectVocabulary(String jpText, String rawSource) {
+    String out = jpText;
+    final normSrc = _normalizeTradForPreprocess(rawSource);
+    final isHardSlang = RegExp(
+      r'(\u808f|\u5c44|\u9e21\u5df4|\u5927\u5c4c|\u9a9a\u903c|\u70c2\u903c|\u6bcd\u72d7|\u8089\u4fbf\u5668|\bjb\b|\brbq\b)',
+      caseSensitive: false,
+    ).hasMatch(normSrc);
+
+    final maleDirect = isHardSlang ? '\u30c1\u30f3\u30dd' : '\u8089\u68d2';
+    final femaleDirect = isHardSlang ? '\u30de\u30f3\u30b3' : '\u871c\u7a74';
+
+    final directReplacements = <String, String>{
+      '男性器': maleDirect,
+      '陰茎': maleDirect,
+      '男根': maleDirect,
+      '剛直': maleDirect,
+      '熱き楔': maleDirect,
+      '熱い楔': maleDirect,
+      '女性器': femaleDirect,
+      '秘部': femaleDirect,
+      '秘所': femaleDirect,
+      '秘裂': femaleDirect,
+      '蜜壺': femaleDirect,
+      '秘めた花壺': femaleDirect,
+      '花壺': femaleDirect,
+      '花園': femaleDirect,
+      '性交する': '\u30cf\u30e1\u308b',
+      '性交': '\u30bb\u30c3\u30af\u30b9',
+      '交합': '\u30bb\u30c3\u30af\u30b9',
+      '結合部': '\u7d50\u5408\u3057\u3066\u3044\u308b\u7a74',
+    };
+
+    directReplacements.forEach((polite, direct) {
+      out = out.replaceAll(polite, direct);
     });
     return out;
   }
@@ -1138,8 +1185,69 @@ class GeminiTranslator {
     return result;
   }
 
+  /// OpenRouterの完全無料モデル群（sk-or-... キー入力時に自動使用）
+  static Future<String> _callOpenRouterFreeModels(
+    String prompt,
+    String apiKey,
+  ) async {
+    const freeModels = <String>[
+      'google/gemma-4-31b-it:free',
+      'nvidia/nemotron-3-super-120b-a12b:free',
+      'google/gemma-4-26b-a4b-it:free',
+      'openrouter/free',
+    ];
+    String lastErr = '';
+    for (final model in freeModels) {
+      try {
+        final response = await _dio.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          data: jsonEncode({
+            'model': model,
+            'messages': [
+              {'role': 'user', 'content': prompt},
+            ],
+            'temperature': 0.7,
+          }),
+          options: Options(
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $apiKey',
+            },
+            sendTimeout: const Duration(seconds: 45),
+            receiveTimeout: const Duration(seconds: 90),
+            validateStatus: (status) => status != null && status < 500,
+          ),
+        );
+        if (response.statusCode == 200 && response.data != null) {
+          final dynamic data = response.data is String
+              ? jsonDecode(response.data)
+              : response.data;
+          if (data is Map && data['choices'] is List && (data['choices'] as List).isNotEmpty) {
+            final msg = data['choices'][0]['message'];
+            final content = msg is Map ? msg['content']?.toString() : null;
+            if (content != null && content.trim().isNotEmpty) {
+              return content.trim();
+            }
+          }
+        } else if (response.statusCode == 429) {
+          throw _RateLimitException('OpenRouter rate limit');
+        } else {
+          lastErr = 'HTTP ${response.statusCode}';
+        }
+      } on _RateLimitException {
+        rethrow;
+      } catch (e) {
+        lastErr = e.toString();
+      }
+    }
+    throw Exception('OpenRouter無料モデルの呼び出しに失敗しました ($lastErr)');
+  }
+
   /// モデル候補を順番に試行して翻訳テキストを取得
   static Future<String> _callGeminiModels(String prompt, String apiKey) async {
+    if (apiKey.startsWith('sk-or-')) {
+      return await _callOpenRouterFreeModels(prompt, apiKey);
+    }
     final models = await _getModelCandidates(apiKey);
     final errors = <String>[];
     bool anyContentBlocked = false;
@@ -1601,3 +1709,4 @@ class GeminiTranslator {
     return chunks;
   }
 }
+
