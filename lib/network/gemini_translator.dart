@@ -597,7 +597,7 @@ class GeminiTranslator {
           trimmed.startsWith('＊') ||
           trimmed.startsWith('*') ||
           trimmed.startsWith('=') ||
-          trimmed.startsWith('第')) {
+          RegExp(r'^第[一二三四五六七八九十百千0-9０-９]+[章節話回幕部篇編](\s|　|$)').hasMatch(trimmed)) {
         formattedLines.add(trimmed);
         continue;
       }
@@ -611,7 +611,10 @@ class GeminiTranslator {
       }
     }
 
-    return formattedLines.join('\n').trim();
+    while (formattedLines.isNotEmpty && formattedLines.last.isEmpty) {
+      formattedLines.removeLast();
+    }
+    return formattedLines.join('\n');
   }
 
   /// 繁体字で書かれた小説でも検閲回避フィルタが確実に動作するよう対象文字を正規化
@@ -646,6 +649,42 @@ class GeminiTranslator {
       '墮': '堕',
       '恥': '耻',
       '奴隸': '奴隶',
+      '們': '们',
+      '體': '体',
+      '與': '与',
+      '驕': '骄',
+      '這': '这',
+      '間': '间',
+      '徹': '彻',
+      '淪': '沦',
+      '發': '发',
+      '嬌': '娇',
+      '聲': '声',
+      '緊': '紧',
+      '濕': '湿',
+      '熱': '热',
+      '顫': '颤',
+      '頂': '顶',
+      '裡': '里',
+      '紅': '红',
+      '腫': '肿',
+      '軟': '软',
+      '燙': '烫',
+      '張': '张',
+      '開': '开',
+      '閉': '闭',
+      '噴': '喷',
+      '湧': '涌',
+      '動': '动',
+      '搖': '摇',
+      '撫': '抚',
+      '夾': '夹',
+      '纏': '缠',
+      '繞': '绕',
+      '鬆': '松',
+      '慾': '欲',
+      '痙': '痉',
+      '攣': '挛',
     };
     String out = text;
     map.forEach((k, v) {
